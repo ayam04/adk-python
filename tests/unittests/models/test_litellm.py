@@ -559,26 +559,6 @@ async def test_generate_content_async_with_model_override(
               role="user", parts=[types.Part.from_text(text="Test prompt")]
           )
       ],
-      config=types.GenerateContentConfig(
-          tools=[
-              types.Tool(
-                  function_declarations=[
-                      types.FunctionDeclaration(
-                          name="test_function",
-                          description="Test function description",
-                          parameters=types.Schema(
-                              type=types.Type.OBJECT,
-                              properties={
-                                  "test_arg": types.Schema(
-                                      type=types.Type.STRING
-                                  )
-                              },
-                          ),
-                      )
-                  ]
-              )
-          ],
-      ),
   )
 
   async for response in lite_llm_instance.generate_content_async(llm_request):
