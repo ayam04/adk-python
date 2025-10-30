@@ -45,6 +45,7 @@ from ...telemetry.tracing import trace_call_llm
 from ...telemetry.tracing import trace_send_data
 from ...telemetry.tracing import tracer
 from ...tools.base_toolset import BaseToolset
+from ...tools.google_search_tool import google_search
 from ...tools.tool_context import ToolContext
 from ...utils.context_utils import Aclosing
 from .audio_cache_manager import AudioCacheManager
@@ -382,6 +383,25 @@ class BaseLlmFlow(ABC):
     events = invocation_context._get_events(
         current_invocation=True, current_branch=True
     )
+
+    # Long running tool calls should have been handled before this point.
+    # If there are still long running tool calls, it means the agent is paused
+    # before, and its branch hasn't been resumed yet.
+    if (
+        invocation_context.is_resumable
+        and events
+        and len(events) > 1
+        # TODO: here we are using the last 2 events to decide whether to pause
+        # the invocation. But this is just being optmisitic, we should find a
+        # way to pause when the long running tool call is followed by more than
+        # one text responses.
+        and (
+            invocation_context.should_pause_invocation(events[-1])
+            or invocation_context.should_pause_invocation(events[-2])
+        )
+    ):
+      return
+
     if (
         invocation_context.is_resumable
         and events
@@ -432,6 +452,10 @@ class BaseLlmFlow(ABC):
     from ...agents.llm_agent import LlmAgent
 
     agent = invocation_context.agent
+    if not isinstance(agent, LlmAgent):
+      raise TypeError(
+          f'Expected agent to be an LlmAgent, but got {type(agent)}'
+      )
 
     # Runs processors.
     for processor in self.request_processors:
@@ -442,6 +466,11 @@ class BaseLlmFlow(ABC):
           yield event
 
     # Run processors for tools.
+
+    # We may need to wrap some built-in tools if there are other tools
+    # because the built-in tools cannot be used together with other tools.
+    # TODO(b/448114567): Remove once the workaround is no longer needed.
+    multiple_tools = len(agent.tools) > 1
     for tool_union in agent.tools:
       tool_context = ToolContext(invocation_context)
 
@@ -455,7 +484,10 @@ class BaseLlmFlow(ABC):
 
       # Then process all tools from this tool union
       tools = await _convert_tool_union_to_tools(
-          tool_union, ReadonlyContext(invocation_context)
+          tool_union,
+          ReadonlyContext(invocation_context),
+          agent.model,
+          multiple_tools,
       )
       for tool in tools:
         await tool.process_llm_request(
@@ -818,6 +850,26 @@ class BaseLlmFlow(ABC):
 
     agent = invocation_context.agent
 
+    # Add grounding metadata to the response if needed.
+    # TODO(b/448114567): Remove this function once the workaround is no longer needed.
+    async def _maybe_add_grounding_metadata(
+        response: Optional[LlmResponse] = None,
+    ) -> Optional[LlmResponse]:
+      readonly_context = ReadonlyContext(invocation_context)
+      tools = await agent.canonical_tools(readonly_context)
+      if not any(tool.name == 'google_search_agent' for tool in tools):
+        return response
+      ground_metadata = invocation_context.session.state.get(
+          'temp:_adk_grounding_metadata', None
+      )
+      if not ground_metadata:
+        return response
+
+      if not response:
+        response = llm_response
+      response.grounding_metadata = ground_metadata
+      return response
+
     callback_context = CallbackContext(
         invocation_context, event_actions=model_response_event.actions
     )
@@ -830,12 +882,12 @@ class BaseLlmFlow(ABC):
         )
     )
     if callback_response:
-      return callback_response
+      return await _maybe_add_grounding_metadata(callback_response)
 
     # If no overrides are provided from the plugins, further run the canonical
     # callbacks.
     if not agent.canonical_after_model_callbacks:
-      return
+      return await _maybe_add_grounding_metadata()
     for callback in agent.canonical_after_model_callbacks:
       callback_response = callback(
           callback_context=callback_context, llm_response=llm_response
@@ -843,7 +895,8 @@ class BaseLlmFlow(ABC):
       if inspect.isawaitable(callback_response):
         callback_response = await callback_response
       if callback_response:
-        return callback_response
+        return await _maybe_add_grounding_metadata(callback_response)
+    return await _maybe_add_grounding_metadata()
 
   def _finalize_model_response_event(
       self,

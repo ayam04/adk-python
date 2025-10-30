@@ -595,6 +595,41 @@ async def test_generate_content_async_without_model_override(
   assert kwargs["model"] == "test_model"
 
 
+@pytest.mark.asyncio
+async def test_generate_content_async_adds_fallback_user_message(
+    mock_acompletion, lite_llm_instance
+):
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user",
+              parts=[],
+          )
+      ]
+  )
+
+  async for _ in lite_llm_instance.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+
+  _, kwargs = mock_acompletion.call_args
+  user_messages = [
+      message for message in kwargs["messages"] if message["role"] == "user"
+  ]
+  assert any(
+      message.get("content")
+      == "Handle the requests as specified in the System Instruction."
+      for message in user_messages
+  )
+  assert (
+      sum(1 for content in llm_request.contents if content.role == "user") == 1
+  )
+  assert llm_request.contents[-1].parts[0].text == (
+      "Handle the requests as specified in the System Instruction."
+  )
+
+
 litellm_append_user_content_test_cases = [
     pytest.param(
         LlmRequest(
@@ -1052,6 +1087,47 @@ def test_content_to_message_param_user_message():
   assert message["content"] == "Test prompt"
 
 
+def test_content_to_message_param_user_message_with_file_uri():
+  file_part = types.Part.from_uri(
+      file_uri="gs://bucket/document.pdf", mime_type="application/pdf"
+  )
+  content = types.Content(
+      role="user",
+      parts=[
+          types.Part.from_text(text="Summarize this file."),
+          file_part,
+      ],
+  )
+
+  message = _content_to_message_param(content)
+  assert message["role"] == "user"
+  assert isinstance(message["content"], list)
+  assert message["content"][0]["type"] == "text"
+  assert message["content"][0]["text"] == "Summarize this file."
+  assert message["content"][1]["type"] == "file"
+  assert message["content"][1]["file"]["file_id"] == "gs://bucket/document.pdf"
+  assert message["content"][1]["file"]["format"] == "application/pdf"
+
+
+def test_content_to_message_param_user_message_file_uri_only():
+  file_part = types.Part.from_uri(
+      file_uri="gs://bucket/only.pdf", mime_type="application/pdf"
+  )
+  content = types.Content(
+      role="user",
+      parts=[
+          file_part,
+      ],
+  )
+
+  message = _content_to_message_param(content)
+  assert message["role"] == "user"
+  assert isinstance(message["content"], list)
+  assert message["content"][0]["type"] == "file"
+  assert message["content"][0]["file"]["file_id"] == "gs://bucket/only.pdf"
+  assert message["content"][0]["file"]["format"] == "application/pdf"
+
+
 def test_content_to_message_param_multi_part_function_response():
   part1 = types.Part.from_function_response(
       name="function_one",
@@ -1227,6 +1303,19 @@ def test_get_content_pdf():
       content[0]["file"]["file_data"]
       == "data:application/pdf;base64,dGVzdF9wZGZfZGF0YQ=="
   )
+  assert content[0]["file"]["format"] == "application/pdf"
+
+
+def test_get_content_file_uri():
+  parts = [
+      types.Part.from_uri(
+          file_uri="gs://bucket/document.pdf",
+          mime_type="application/pdf",
+      )
+  ]
+  content = _get_content(parts)
+  assert content[0]["type"] == "file"
+  assert content[0]["file"]["file_id"] == "gs://bucket/document.pdf"
   assert content[0]["file"]["format"] == "application/pdf"
 
 
